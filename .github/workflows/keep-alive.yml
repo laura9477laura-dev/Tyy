@@ -1,0 +1,65 @@
+name: Keep Alive
+
+on:
+  # Décalé de l'heure pile (ex: :03, :13...) pour éviter les pics de charge
+  # que GitHub connaît en général au début de chaque heure.
+  schedule:
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping le serveur Render
+        run: |
+          echo "Ping de $RENDER_URL"
+          set +e
+          status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 "$RENDER_URL")
+          curl_exit=$?
+          set -e
+          echo "Réponse HTTP: $status (code curl: $curl_exit)"
+          # Le but est juste de réveiller/maintenir le serveur : un 401/404
+          # prouve déjà qu'il répond. Seule l'absence totale de réponse
+          # (timeout, DNS, connexion refusée) fait échouer le job.
+          if [ "$curl_exit" != "0" ] || [ "$status" = "000" ]; then
+            echo "::error::Aucune réponse du serveur (code curl $curl_exit). Vérifiez que le secret RENDER_URL est correct et que le service Render est bien démarré."
+            curl -v --max-time 90 "$RENDER_URL" || true
+            exit 1
+          fi
+        env:
+          RENDER_URL: ${{ secrets.RENDER_URL }}
+
+  # GitHub désactive un workflow "schedule" après 60 jours SANS commit sur
+  # le repo — exécuter ce workflow ne compte pas comme activité, seul un
+  # commit/push le fait. Ce job pousse un commit trivial (mise à jour d'un
+  # simple fichier marqueur) avant que ce délai n'expire, pour que le ping
+  # ci-dessus ne s'arrête jamais tout seul.
+  keep-repo-active:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Commit marker if repo is close to the 60-day inactivity limit
+        run: |
+          last_commit_ts=$(git log -1 --format=%ct)
+          now_ts=$(date +%s)
+          days_since=$(( (now_ts - last_commit_ts) / 86400 ))
+          echo "Dernier commit il y a $days_since jour(s)."
+          # Marge de sécurité : on rafraîchit dès 45 jours, bien avant la
+          # limite de 60 jours de GitHub.
+          if [ "$days_since" -ge 45 ]; then
+            mkdir -p .github/keepalive
+            echo "Dernier ping automatique : $(date -u +%Y-%m-%dT%H:%M:%SZ)" > .github/keepalive/last-active.md
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/keepalive/last-active.md
+            git commit -m "chore: keep scheduled workflows active"
+            git push
+          else
+            echo "Pas encore nécessaire (limite à 45 jours)."
+          fi
